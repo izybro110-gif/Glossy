@@ -58,6 +58,7 @@ import coil3.request.allowHardware
 import coil3.request.crossfade
 import coil3.toBitmap
 import com.jay.glossy.R
+import com.jay.glossy.LocalNavController
 import com.jay.glossy.LocalPlayerConnection
 import com.jay.glossy.canvas.CanvasArtwork
 import com.jay.glossy.constants.CanvasThumbnailAnimationKey
@@ -596,6 +597,16 @@ private fun AppleMusicMainTitleRow(
 ) {
     val playerConnection = LocalPlayerConnection.current ?: return
     val mediaMetadata by playerConnection.mediaMetadata.collectAsStateWithLifecycle()
+    val navController = LocalNavController.current
+
+    // The artist line is the only way into an artist page from this design, so
+    // it is a link. A track can credit several artists and the metadata can
+    // carry a credit with no id at all, so the target is the first credit that
+    // actually resolves to a page rather than blindly the first one.
+    val artistTargetId =
+        mediaMetadata?.artists
+            ?.firstOrNull { !it.id.isNullOrBlank() }
+            ?.id
     
     Row(
         // AppleMusicGutter, not a literal: the canvas-glow mini lyrics above this
@@ -616,7 +627,18 @@ private fun AppleMusicMainTitleRow(
                     .basicMarquee()
             )
             Spacer(modifier = Modifier.height(4.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier =
+                    Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(enabled = artistTargetId != null) {
+                            artistTargetId?.let { artistId ->
+                                navController.navigate("artist/$artistId")
+                                bottomSheetState.collapseSoft()
+                            }
+                        },
+            ) {
                 if (mediaMetadata?.explicit == true) {
                     Icon(
                         painter = painterResource(R.drawable.explicit), 
