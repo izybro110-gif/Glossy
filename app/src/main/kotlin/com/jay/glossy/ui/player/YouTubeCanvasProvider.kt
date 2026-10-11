@@ -1,66 +1,82 @@
+/**
+ * Glossy Project (C) 2026
+ * Licensed under GPL-3.0 | See git history for contributors
+ *
+ * YouTube as a canvas source: the visualizer clips and Shorts a label uploads
+ * for a song are often the only animated artwork that exists for it.
+ *
+ * Two things decide whether this provider can answer at all, and both are
+ * deliberately chosen here rather than left to the client's playback path:
+ *
+ *  - **The lookup goes through the app's shared [YouTube] client**, not a
+ *    private one. It carries the session's visitor data, proxy and cookies, so
+ *    the request looks like the rest of the app's traffic instead of an
+ *    anonymous burst YouTube is free to answer with a bot check.
+ *
+ *  - **The stream URL is asked for with clients that work while signed out.**
+ *    A canvas is wanted by everyone, and most people never sign into YouTube in
+ *    the app. `WEB_REMIX` — the client the player uses for music metadata —
+ *    answers `UNPLAYABLE` / "Video unavailable" for ordinary user-uploaded
+ *    clips when there is no account behind it, and its streaming data comes
+ *    back with no URL at all without a PoToken. `IOS` answers those same clips
+ *    with plain progressive URLs that serve bytes without a signature, a token
+ *    or a special User-Agent, and it needs no login, so it is asked first. The
+ *    remaining clients are fallbacks for the clips it declines.
+ *
+ * Answers are cached per song for a day; a lookup that fails outright throws
+ * [CanvasLookupUnavailable] so the report can tell "the lookup broke" apart
+ * from "YouTube had nothing for this song".
+ */
+
 package com.jay.glossy.ui.player
 
 import com.jay.glossy.canvas.CanvasArtwork
 import com.jay.glossy.canvas.CanvasLookupUnavailable
-import com.metrolist.innertube.InnerTube
-import com.metrolist.innertube.models.YouTubeClient
-import com.metrolist.innertube.models.getItems
-import com.metrolist.innertube.models.response.PlayerResponse
-import com.metrolist.innertube.models.response.SearchResponse
+import com.metrolist.innertube.YouTube
+import com.metrolist.innertube.YouTube.SearchFilter
 import com.metrolist.innertube.models.SongItem
-import com.metrolist.innertube.pages.SearchPage
-import io.ktor.client.HttpClient
-import io.ktor.client.call.body
-import io.ktor.client.engine.okhttp.OkHttp
-import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.compression.ContentEncoding
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.serialization.kotlinx.json.json
+import com.metrolist.innertube.models.YouTubeClient
+import com.metrolist.innertube.models.response.PlayerResponse
 import kotlinx.coroutines.CancellationException
-import kotlinx.serialization.json.Json
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 object YouTubeCanvasProvider {
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-        explicitNulls = false
-    }
-
-    private val innerTube = InnerTube()
-
-    private val client by lazy {
-        HttpClient(OkHttp) {
-            install(ContentNegotiation) { json(json) }
-            install(HttpTimeout) {
-                connectTimeoutMillis = 15_000
-                requestTimeoutMillis = 30_000
-                socketTimeoutMillis = 30_000
-            }
-            install(ContentEncoding) {
-                gzip()
-                deflate()
-            }
-            expectSuccess = false
-        }
-    }
-
     private val cache = ConcurrentHashMap<String, CacheEntry>()
-    private data class CacheEntry(val value: CanvasArtwork?, val expiresAtMs: Long)
+
+    private data class CacheEntry(
+        val value: CanvasArtwork?,
+        val expiresAtMs: Long,
+    )
+
     private const val CACHE_TTL_MS = 1000L * 60 * 60 * 24
 
+    /** A clip longer than this is a music video, not a looping canvas. */
     private const val MAX_VIDEO_DURATION_SECONDS = 90
 
-    suspend fun getBySongArtist(song: String, artist: String, album: String? = null): CanvasArtwork? {
+    /**
+     * The clients a stream URL is asked for, in order of how well they answer
+     * while signed out. Every one of them is login-free: a canvas must not
+     * depend on the account that happens to be connected.
+     */
+    private val streamClients =
+        listOf(
+            YouTubeClient.IOS,
+            YouTubeClient.ANDROID_VR_NO_AUTH,
+            YouTubeClient.TVHTML5_SIMPLY_EMBEDDED_PLAYER,
+            YouTubeClient.WEB_REMIX,
+        )
+
+    suspend fun getBySongArtist(
+        song: String,
+        artist: String,
+        album: String? = null,
+    ): CanvasArtwork? {
         val key = "$song|$artist|${album ?: ""}".lowercase(Locale.ROOT)
         cache[key]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }?.let { return it.value }
 
-        val queries = buildSearchQueries(song, artist)
-        
-        for (query in queries) {
-            val result = searchAndExtractVideoUrl(query, song, artist)
-            if (result != null) {
+        for (query in buildSearchQueries(song, artist)) {
+            searchAndExtractVideoUrl(query, song, artist)?.let { result ->
                 cache[key] = CacheEntry(result, System.currentTimeMillis() + CACHE_TTL_MS)
                 return result
             }
@@ -69,18 +85,38 @@ object YouTubeCanvasProvider {
         return null
     }
 
-    private fun buildSearchQueries(song: String, artist: String): List<String> {
-        val normalizedSong = song
-            .replace(Regex("\\s*\\[[^]]*]"), "")
-            .replace(Regex("\\s*\\((?:feat\\.?|ft\\.?|featuring|with)\\b[^)]*\\)", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\s*\\((?:official\\s*)?(?:music\\s*)?(?:video|mv|lyrics?|audio|visualizer|live|remaster(?:ed)?|version|edit|mix|remix)[^)]*\\)", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        
-        val normalizedArtist = artist
-            .split(Regex("(?:\\s*,\\s*|\\s*&\\s*|\\s+×\\s+|\\s+x\\s+|\\bfeat\\.?\\b|\\bft\\.?\\b|\\bfeaturing\\b|\\bwith\\b)", RegexOption.IGNORE_CASE), limit = 2)
-            .firstOrNull()?.replace(Regex("\\s+"), " ")?.trim() ?: ""
-        
+    private fun buildSearchQueries(
+        song: String,
+        artist: String,
+    ): List<String> {
+        val normalizedSong =
+            song
+                .replace(Regex("\\s*\\[[^]]*]"), "")
+                .replace(Regex("\\s*\\((?:feat\\.?|ft\\.?|featuring|with)\\b[^)]*\\)", RegexOption.IGNORE_CASE), "")
+                .replace(
+                    Regex(
+                        "\\s*\\((?:official\\s*)?(?:music\\s*)?(?:video|mv|lyrics?|audio|visualizer|live|remaster(?:ed)?|version|edit|mix|remix)[^)]*\\)",
+                        RegexOption.IGNORE_CASE,
+                    ),
+                    "",
+                )
+                .replace(Regex("\\s+"), " ")
+                .trim()
+
+        val normalizedArtist =
+            artist
+                .split(
+                    Regex(
+                        "(?:\\s*,\\s*|\\s*&\\s*|\\s+×\\s+|\\s+x\\s+|\\bfeat\\.?\\b|\\bft\\.?\\b|\\bfeaturing\\b|\\bwith\\b)",
+                        RegexOption.IGNORE_CASE,
+                    ),
+                    limit = 2,
+                )
+                .firstOrNull()
+                ?.replace(Regex("\\s+"), " ")
+                ?.trim()
+                ?: ""
+
         return listOf(
             "$normalizedArtist $normalizedSong visualizer",
             "$normalizedArtist $normalizedSong canvas",
@@ -90,98 +126,131 @@ object YouTubeCanvasProvider {
         ).distinct()
     }
 
+    /**
+     * Searches for video uploads of one query and returns the first clip that
+     * validates and yields a URL.
+     *
+     * A failed search or a search endpoint that refuses the request is reported
+     * as [CanvasLookupUnavailable] — the question was never answered, and the
+     * caller must not remember that as "this song has no canvas".
+     */
     private suspend fun searchAndExtractVideoUrl(
         query: String,
         songValidation: String,
         artistValidation: String,
     ): CanvasArtwork? {
-        try {
-            val searchResponse = innerTube.search(
-                client = YouTubeClient.WEB_REMIX,
-                query = query,
-            ).body<SearchResponse>()
-
-            val items = searchResponse.contents
-                ?.tabbedSearchResultsRenderer
-                ?.tabs
-                ?.firstOrNull()
-                ?.tabRenderer
-                ?.content
-                ?.sectionListRenderer
-                ?.contents
-                ?.flatMap { section ->
-                    section.musicShelfRenderer?.contents?.getItems() 
-                        ?: section.itemSectionRenderer?.contents?.mapNotNull { it.musicResponsiveListItemRenderer }
-                        ?: emptyList()
-                }
-                ?.mapNotNull { SearchPage.toYTItem(it) }
-                ?: return null
-
-            for (item in items) {
-                if (item is SongItem) {
-                    val resultTitle = item.title
-                    val resultArtist = item.artists?.firstOrNull()?.name.orEmpty()
-
-                    if (songValidation.isNotBlank() && !resultTitle.contains(songValidation, true)) continue
-                    if (artistValidation.isNotBlank() && !resultArtist.contains(artistValidation, true)) continue
-
-                    val durationSeconds = item.duration ?: 0
-                    val isShort = durationSeconds > 0 && durationSeconds <= MAX_VIDEO_DURATION_SECONDS
-                    val isVisualizer = resultTitle.contains("visualizer", true) || 
-                                       resultTitle.contains("canvas", true) ||
-                                       resultTitle.contains("#shorts", true)
-
-                    if (!isShort && !isVisualizer && durationSeconds > MAX_VIDEO_DURATION_SECONDS) continue
-
-                    val videoUrl = getVideoStreamUrl(item.id)
-                    if (!videoUrl.isNullOrBlank()) {
-                        return CanvasArtwork(
-                            name = resultTitle,
-                            artist = resultArtist,
-                            videoUrl = videoUrl,
-                        )
-                    }
-                }
+        val videos =
+            try {
+                YouTube.search(query, SearchFilter.FILTER_VIDEO).getOrThrow()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw CanvasLookupUnavailable("YouTube search failed", e)
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            throw CanvasLookupUnavailable("YouTube lookup failed", e)
+
+        for (item in videos.items.filterIsInstance<SongItem>()) {
+            val resultTitle = item.title
+            val uploader = item.artists.firstOrNull()?.name.orEmpty()
+
+            if (songValidation.isNotBlank() && !resultTitle.contains(songValidation, true)) continue
+
+            // The name in the video's *title* counts as the artist here. A
+            // visualizer is uploaded under a label or a fan channel as often as
+            // under the artist's own account, and the uploader name is then
+            // either a different entity or a misspelling of the artist —
+            // "Talwiinder" against an uploader called "Talvinder" — so
+            // demanding the uploader match rejected exactly the clips this
+            // provider exists to find, while the title said who the song was
+            // by all along. The artist is only *reported* when it agrees; when
+            // it does not, the canvas check is left to decide on the title.
+            val artistAgrees =
+                artistValidation.isBlank() ||
+                    uploader.contains(artistValidation, true) ||
+                    resultTitle.contains(artistValidation, true)
+            if (!artistAgrees) continue
+
+            val durationSeconds = item.duration ?: 0
+            val isShort = durationSeconds > 0 && durationSeconds <= MAX_VIDEO_DURATION_SECONDS
+            val isVisualizer =
+                resultTitle.contains("visualizer", true) ||
+                    resultTitle.contains("canvas", true) ||
+                    resultTitle.contains("#shorts", true)
+
+            if (!isShort && !isVisualizer && durationSeconds > MAX_VIDEO_DURATION_SECONDS) continue
+
+            val videoUrl = getVideoStreamUrl(item.id)
+            if (!videoUrl.isNullOrBlank()) {
+                return CanvasArtwork(
+                    name = resultTitle,
+                    artist = uploader.takeIf { it.isNotBlank() && it.contains(artistValidation, true) },
+                    videoUrl = videoUrl,
+                )
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * The first direct video URL any login-free client is willing to hand over.
+     *
+     * Clients are tried in turn rather than raced: a refusal from one says
+     * nothing about the next, and the whole sequence costs a handful of
+     * requests that are only paid once per song thanks to the cache above.
+     */
+    private suspend fun getVideoStreamUrl(videoId: String): String? {
+        for (client in streamClients) {
+            val response =
+                try {
+                    YouTube.player(videoId, null, client).getOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+            if (response == null || response.playabilityStatus.status != "OK") continue
+            bestVideoUrl(response)?.let { return it }
         }
         return null
     }
 
-    private suspend fun getVideoStreamUrl(videoId: String): String? {
-        try {
-            val playerResponse = innerTube.player(
-                client = YouTubeClient.WEB_REMIX,
-                videoId = videoId,
-                playlistId = null,
-                signatureTimestamp = null,
-                poToken = null,
-            ).body<PlayerResponse>()
-
-            val streamingData = playerResponse.streamingData ?: return null
-            
-            val videoFormats = streamingData.adaptiveFormats
+    /** The largest video-only rendition that carries a usable address. */
+    private fun bestVideoUrl(response: PlayerResponse): String? {
+        val formats = response.streamingData?.adaptiveFormats.orEmpty()
+        val videoFormats =
+            formats
                 .filter { !it.isAudio && it.mimeType.startsWith("video/") }
                 .filter { it.width != null && it.height != null }
-                .filter { it.url != null || it.signatureCipher != null || it.cipher != null }
 
-            if (videoFormats.isEmpty()) return null
-
-            val bestFormat = videoFormats
+        val best =
+            videoFormats
+                .filter { !it.url.isNullOrBlank() || !it.signatureCipher.isNullOrBlank() || !it.cipher.isNullOrBlank() }
                 .maxByOrNull { (it.height ?: 0) * (it.width ?: 0) }
-            
-            return bestFormat?.url ?: bestFormat?.signatureCipher?.let { decryptSignature(it) } ?: bestFormat?.cipher?.let { decryptSignature(it) }
-        } catch (e: Exception) {
-            return null
-        }
+                ?: return null
+
+        return best.url?.takeIf { it.isNotBlank() }
+            ?: best.signatureCipher?.let { decryptSignature(it) }
+            ?: best.cipher?.let { decryptSignature(it) }
     }
 
+    /**
+     * Last resort for a client that answers with a ciphered address anyway. The
+     * players the app uses for playback de-obfuscate these properly; this only
+     * keeps the plain `&signature=` form working for the rare format that
+     * arrives that way, and returns null when the cipher would need real
+     * signature deciphering.
+     */
     private fun decryptSignature(cipher: String): String? {
-        val params = cipher.split("&").associate { it.split("=").let { (k, v) -> k to v } }
+        val params =
+            cipher.split("&").mapNotNull { part ->
+                val separator = part.indexOf('=')
+                if (separator <= 0) null else part.substring(0, separator) to part.substring(separator + 1)
+            }.toMap()
+
         val signature = params["s"] ?: params["sig"] ?: params["signature"] ?: return null
+        // A real `s` needs the player's signature function; a `sig` is already
+        // the finished value.
+        if (params["s"] != null && params["sig"] == null && params["signature"] == null) return null
         val url = params["url"] ?: return null
         return "$url&signature=$signature"
     }
