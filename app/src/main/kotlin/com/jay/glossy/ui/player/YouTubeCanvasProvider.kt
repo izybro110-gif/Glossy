@@ -118,6 +118,7 @@ object YouTubeCanvasProvider {
                 ?: ""
 
         return listOf(
+            "$normalizedArtist $normalizedSong official visualizer",
             "$normalizedArtist $normalizedSong visualizer",
             "$normalizedArtist $normalizedSong canvas",
             "$normalizedArtist $normalizedSong #shorts",
@@ -125,6 +126,68 @@ object YouTubeCanvasProvider {
             "$normalizedSong #shorts",
         ).distinct()
     }
+
+    /**
+     * Titles that mark a clip as somebody's edit, cover or AI-made montage
+     * rather than the song's own canvas. The search happily returns fan
+     * uploads that carry the song's name — "Rathinamo audio edit", a slowed
+     * re-upload, an AI-art montage — and until they were refused the player
+     * showed them under the song's title as its canvas.
+     *
+     * A marker only rejects a clip when the song's own title does not carry
+     * the same word, so a track actually called "Edit" does not lose every
+     * candidate to this list.
+     */
+    private val notCanvasMarkers =
+        listOf(
+            """\baudio\s+edits?\b""",
+            """\bedits?\b""",
+            """\bcovers?\b""",
+            """\bmashups?\b""",
+            """\bslowed\b""",
+            """\breverb\b""",
+            """\bsped\s+up\b""",
+            """\bnightcore\b""",
+            """\bbass\s+boost(ed)?\b""",
+            """\bai\s+(art|images?|video|generated|covers?|edits?)\b""",
+            """\bai\b""",
+            """\bamv\b""",
+            """\bfan\s*-?\s*made\b""",
+            """\bcreations?\b""",
+            """\breactions?\b""",
+            """\blyrical\s+video\b""",
+            """\bbehind\s+the\s+scenes\b""",
+            """\btrailer\b""",
+        ).map { Regex(it, RegexOption.IGNORE_CASE) }
+
+    private fun looksLikeFanEdit(
+        resultTitle: String,
+        songTitle: String,
+    ): Boolean = notCanvasMarkers.any { marker -> marker.containsMatchIn(resultTitle) && !marker.containsMatchIn(songTitle) }
+
+    /**
+     * Whether the upload looks like the song's own release rather than a fan
+     * re-upload: the artist's own channel, a VEVO channel, or YouTube's
+     * auto-generated "<Artist> - Topic" channel.
+     */
+    private fun isOfficialUpload(
+        uploader: String,
+        artist: String,
+    ): Boolean {
+        val channel = uploader.lowercase(Locale.ROOT)
+        if (artist.isNotBlank() && channel.contains(artist.lowercase(Locale.ROOT))) return true
+        if (channel.endsWith("vevo")) return true
+        if (channel.endsWith("topic")) return true
+        return false
+    }
+
+    /** One clip the search found, before it is ranked against the others. */
+    private class Candidate(
+        val item: SongItem,
+        val title: String,
+        val uploader: String,
+        val isVisualizer: Boolean,
+    )
 
     /**
      * Searches for video uploads of one query and returns the first clip that
@@ -148,44 +211,77 @@ object YouTubeCanvasProvider {
                 throw CanvasLookupUnavailable("YouTube search failed", e)
             }
 
-        for (item in videos.items.filterIsInstance<SongItem>()) {
-            val resultTitle = item.title
-            val uploader = item.artists.firstOrNull()?.name.orEmpty()
+        val songTokens =
+            normalizeCanvasSongTitle(songValidation)
+                .split(Regex("\\s+"))
+                .filter { it.isNotBlank() }
 
-            if (songValidation.isNotBlank() && !resultTitle.contains(songValidation, true)) continue
+        val candidates =
+            videos.items.filterIsInstance<SongItem>().mapNotNull { item ->
+                val resultTitle = item.title
+                val uploader = item.artists.firstOrNull()?.name.orEmpty()
 
-            // The name in the video's *title* counts as the artist here. A
-            // visualizer is uploaded under a label or a fan channel as often as
-            // under the artist's own account, and the uploader name is then
-            // either a different entity or a misspelling of the artist —
-            // "Talwiinder" against an uploader called "Talvinder" — so
-            // demanding the uploader match rejected exactly the clips this
-            // provider exists to find, while the title said who the song was
-            // by all along. The artist is only *reported* when it agrees; when
-            // it does not, the canvas check is left to decide on the title.
-            val artistAgrees =
-                artistValidation.isBlank() ||
-                    uploader.contains(artistValidation, true) ||
-                    resultTitle.contains(artistValidation, true)
-            if (!artistAgrees) continue
+                // Every word of the song's own title has to appear in the
+                // clip's title. The substring test this replaces let a clip
+                // through on one shared word, which is how a canvas belonging
+                // to another song reached this song's player.
+                if (songTokens.isNotEmpty() && !songTokens.all { resultTitle.contains(it, true) }) return@mapNotNull null
 
-            val durationSeconds = item.duration ?: 0
-            val isShort = durationSeconds > 0 && durationSeconds <= MAX_VIDEO_DURATION_SECONDS
-            val isVisualizer =
-                resultTitle.contains("visualizer", true) ||
-                    resultTitle.contains("canvas", true) ||
-                    resultTitle.contains("#shorts", true)
+                // The name in the video's *title* counts as the artist here. A
+                // visualizer is uploaded under a label as often as under the
+                // artist's own account, and the uploader name is then either a
+                // different entity or a misspelling — "Talwiinder" against an
+                // uploader called "Talvinder" — so demanding the uploader match
+                // rejected exactly the clips this provider exists to find.
+                val artistAgrees =
+                    artistValidation.isBlank() ||
+                        uploader.contains(artistValidation, true) ||
+                        resultTitle.contains(artistValidation, true)
+                if (!artistAgrees) return@mapNotNull null
 
-            if (!isShort && !isVisualizer && durationSeconds > MAX_VIDEO_DURATION_SECONDS) continue
+                if (looksLikeFanEdit(resultTitle, songValidation)) return@mapNotNull null
 
-            val videoUrl = getVideoStreamUrl(item.id)
-            if (!videoUrl.isNullOrBlank()) {
-                return CanvasArtwork(
-                    name = resultTitle,
-                    artist = uploader.takeIf { it.isNotBlank() && it.contains(artistValidation, true) },
-                    videoUrl = videoUrl,
-                )
+                val durationSeconds = item.duration ?: 0
+                val isShort = durationSeconds > 0 && durationSeconds <= MAX_VIDEO_DURATION_SECONDS
+                val isVisualizer =
+                    resultTitle.contains("visualizer", true) ||
+                        resultTitle.contains("canvas", true) ||
+                        resultTitle.contains("#shorts", true)
+
+                if (!isShort && !isVisualizer && durationSeconds > MAX_VIDEO_DURATION_SECONDS) return@mapNotNull null
+
+                Candidate(item, resultTitle, uploader, isVisualizer)
             }
+
+        // The song's own uploads come first, then clips whose title names the
+        // artist, and only then anything left that matched — a visualizer
+        // title wins a tie. Taking the first search hit as-is is what let a
+        // fan edit outrank the label's own canvas.
+        val ordered =
+            candidates.sortedWith(
+                compareBy<Candidate> { candidate ->
+                    when {
+                        isOfficialUpload(candidate.uploader, artistValidation) -> 0
+                        artistValidation.isNotBlank() && candidate.title.contains(artistValidation, true) -> 1
+                        else -> 2
+                    }
+                }.thenByDescending { it.isVisualizer },
+            )
+
+        for (candidate in ordered) {
+            val videoUrl = getVideoStreamUrl(candidate.item.id)
+            if (videoUrl.isNullOrBlank()) continue
+            return CanvasArtwork(
+                name = candidate.title,
+                // Reported as the artist's when the channel or the title says
+                // so, so the canvas check downstream has a name to judge
+                // instead of always falling back to the title alone.
+                artist =
+                    candidate.uploader
+                        .takeIf { it.isNotBlank() && it.contains(artistValidation, true) }
+                        ?: artistValidation.takeIf { it.isNotBlank() && candidate.title.contains(it, true) },
+                videoUrl = videoUrl,
+            )
         }
 
         return null
