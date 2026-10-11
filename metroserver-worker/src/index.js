@@ -563,15 +563,23 @@ export class RoomHub {
       await this.#sendError(ws, P.E_NOT_IN_ROOM, 'not in a room');
       return;
     }
-    if (!member.isHost && member.userId !== room.hostId) {
-      await this.#sendError(ws, P.E_NOT_HOST, 'only the host controls playback');
-      return;
-    }
-
     const fields = new P.Fields(payload);
     const action = fields.string(1);
     if (!P.PLAYBACK_ACTIONS.has(action)) {
       await this.#sendError(ws, P.E_INVALID_MESSAGE, `unknown action ${action}`);
+      return;
+    }
+
+    if (!member.isHost && member.userId !== room.hostId) {
+      // Volume is per-listener: every device plays the stream itself, so a
+      // guest asking for a volume is talking about their own speaker, never
+      // about the room. Refusing it was an error the guest could do nothing
+      // about (and the client surfaced it as "only the host controls
+      // playback"), which is what made the mute button look broken while a
+      // room was live. It is accepted and dropped — no room state changes and
+      // nothing is relayed — so the room's volume stays the host's.
+      if (action === P.A_SET_VOLUME) return;
+      await this.#sendError(ws, P.E_NOT_HOST, 'only the host controls playback');
       return;
     }
 
@@ -677,6 +685,8 @@ export class RoomHub {
       P.pbString(1, newHost.userId),
       P.pbString(2, newHost.username),
     ));
+    // The new host inherits whatever the old one never got to look at.
+    await this.#flushPendingSuggestions(room, newHost);
     await this.#persist();
   }
 
@@ -720,7 +730,33 @@ export class RoomHub {
       P.pbString(1, member.userId),
       P.pbString(2, member.username),
     ), ws);
+    if (member.isHost) await this.#flushPendingSuggestions(room, member);
     await this.#persist();
+  }
+
+  /**
+   * Re-sends every pending suggestion to the host.
+   *
+   * A suggestion used to be delivered exactly once, to whatever host socket
+   * existed at that instant. Hosting happens from a phone, so that socket is
+   * often gone when a guest suggests something — the app backgrounded, the
+   * screen off, the connection reconnecting — and the suggestion then sat in
+   * `room.suggestions` forever: the guest had been told it was sent, and
+   * nothing ever reached the host. Replaying the backlog whenever the host
+   * (re)connects is what makes "my friend can't add music" stop depending on
+   * the host happening to be looking at the screen.
+   */
+  async #flushPendingSuggestions(room, host) {
+    if (!host || !host.ws) return;
+    for (const [suggestionId, entry] of room.suggestions) {
+      const from = room.members.get(entry.userId);
+      await this.#send(host.ws, P.S_SUGGESTION_RECEIVED, P.concat(
+        P.pbString(1, suggestionId),
+        P.pbString(2, entry.userId),
+        P.pbString(3, from ? from.username : ''),
+        P.pbMessage(4, entry.track.encode()),
+      ));
+    }
   }
 
   async #onSuggestTrack(ws, payload) {

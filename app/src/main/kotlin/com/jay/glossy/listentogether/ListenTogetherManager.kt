@@ -734,10 +734,18 @@ class ListenTogetherManager
         }
 
         private fun updateGuestMuteState() {
-            // Guests are no longer forced to mute - they can hear the music too
-            val connection = playerConnection ?: return
-            // Just restore any previously forced mute state (should typically be none)
-            restoreGuestMuteState()
+            // Guests are allowed to hear the music, so there is no forced mute
+            // state to re-apply here.
+            //
+            // This used to restore the state captured when the room was joined,
+            // and it runs on every role change and every player-connection
+            // refresh. That wrote the pre-join value straight back over the
+            // guest's own choice: a guest muted, the connection was rebuilt (a
+            // notification tap, the service re-binding), and they were unmuted
+            // again a moment later — the mute button looked broken. The saved
+            // state belongs to *leaving* the room, which is where
+            // [cleanup] restores it.
+            if (!isInRoom && previousMuteState != null) restoreGuestMuteState()
         }
 
         /**

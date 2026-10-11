@@ -636,7 +636,13 @@ private fun ServerChooserDialog(
     onUseCustom: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var customUrl by rememberSaveable(currentUrl) { mutableStateOf(currentUrl) }
+    // Deliberately empty, never seeded with [currentUrl]: the address in use can
+    // be one of our own `*.workers.dev` deployments, whose host carries the
+    // deployer's account label (an e-mail-derived handle). Seeding the field
+    // put that label on screen the moment the chooser opened, which is exactly
+    // what the masked addresses above avoid. The field is for typing a new
+    // address, so it starts blank.
+    var customUrl by rememberSaveable { mutableStateOf("") }
     val trimmedCustomUrl = customUrl.trim()
 
     DefaultDialog(
@@ -729,6 +735,13 @@ private fun ServerChooserDialog(
                 label = { Text(stringResource(R.string.listen_together_server_url)) },
                 leadingIcon = {
                     Icon(painterResource(R.drawable.link), contentDescription = null)
+                },
+                placeholder = {
+                    Text(
+                        text = "wss://your-server.example/ws",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),

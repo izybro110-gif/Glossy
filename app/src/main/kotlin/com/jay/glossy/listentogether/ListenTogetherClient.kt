@@ -1539,13 +1539,20 @@ class ListenTogetherClient
                                 log(LogLevel.INFO, "Auto-approving suggestion", "${payload.fromUsername}: ${payload.trackInfo.title}")
                                 approveSuggestion(payload.suggestionId)
                             } else {
-                                // Add to pending list and show notification
-                                _pendingSuggestions.value += payload
-                                // Notify the host with actionable notification
-                                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
-                                    PackageManager.PERMISSION_GRANTED
-                                ) {
-                                    showSuggestionNotification(payload)
+                                // Add to pending list and show notification. The
+                                // server replays its backlog whenever the host
+                                // reconnects, so a suggestion can arrive twice in
+                                // one session (a socket drop, not an app restart);
+                                // hold each id once so the list does not grow
+                                // duplicates of the same pending track.
+                                if (_pendingSuggestions.value.none { it.suggestionId == payload.suggestionId }) {
+                                    _pendingSuggestions.value += payload
+                                    // Notify the host with actionable notification
+                                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                                        PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        showSuggestionNotification(payload)
+                                    }
                                 }
                             }
                         }
