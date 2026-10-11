@@ -508,7 +508,11 @@ object CanvasResolver {
                         } ?: AppleMusicCanvasProvider.getBySongArtist(query.title, query.artist, query.album, query.storefront)
                     }
                 },
-                launch { ask(YouTubeProvider) { YouTubeCanvasProvider.getBySongArtist(query.title, query.artist, query.album) } },
+                launch {
+                    ask(YouTubeProvider) {
+                        YouTubeCanvasProvider.getBySongArtist(query.title, query.artist, query.album, query.mediaId)
+                    }
+                },
             )
 
         var winner: CanvasArtwork? = null
@@ -610,7 +614,7 @@ object CanvasResolver {
             query,
             YouTubeProvider,
             askProvider(YouTubeProvider, answers) {
-                YouTubeCanvasProvider.getBySongArtist(query.title, query.artist, query.album)
+                YouTubeCanvasProvider.getBySongArtist(query.title, query.artist, query.album, query.mediaId)
             },
             answers,
         )

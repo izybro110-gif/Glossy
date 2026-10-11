@@ -34,6 +34,7 @@ import com.jay.glossy.canvas.CanvasArtwork
 import com.jay.glossy.canvas.CanvasLookupUnavailable
 import com.metrolist.innertube.YouTube
 import com.metrolist.innertube.YouTube.SearchFilter
+import com.metrolist.innertube.models.WatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_ATV
 import com.metrolist.innertube.models.SongItem
 import com.metrolist.innertube.models.YouTubeClient
 import com.metrolist.innertube.models.response.PlayerResponse
@@ -71,9 +72,24 @@ object YouTubeCanvasProvider {
         song: String,
         artist: String,
         album: String? = null,
+        videoId: String? = null,
     ): CanvasArtwork? {
         val key = "$song|$artist|${album ?: ""}".lowercase(Locale.ROOT)
         cache[key]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }?.let { return it.value }
+
+        // The track's own video first. The app is already playing a YouTube
+        // video id, and for any song YouTube Music carries as a real video —
+        // an official music video, an artist upload — that id *is* the
+        // song's original animation: exact by construction, and one player
+        // request instead of five searches. Only the auto-generated "- Topic"
+        // uploads (a still image with the audio attached) have nothing to
+        // animate, and those fall through to the search below.
+        videoId?.let { id ->
+            getTrackVideoCanvas(id, song, artist)?.let { result ->
+                cache[key] = CacheEntry(result, System.currentTimeMillis() + CACHE_TTL_MS)
+                return result
+            }
+        }
 
         for (query in buildSearchQueries(song, artist)) {
             searchAndExtractVideoUrl(query, song, artist)?.let { result ->
@@ -82,6 +98,59 @@ object YouTubeCanvasProvider {
             }
         }
 
+        return null
+    }
+
+    /**
+     * The animation behind the track's own video id, or null when that id has
+     * nothing to animate.
+     *
+     * [MUSIC_VIDEO_TYPE_ATV] is YouTube Music's auto-generated "- Topic"
+     * upload: the audio over one still frame, so playing it would freeze the
+     * canvas exactly where the still artwork already was. Everything else —
+     * an official music video (OMV), an artist video, a plain upload — moves.
+     */
+    private suspend fun getTrackVideoCanvas(
+        videoId: String,
+        song: String,
+        artist: String,
+    ): CanvasArtwork? {
+        if (videoId.isBlank()) return null
+
+        val songTokens =
+            normalizeCanvasSongTitle(song)
+                .split(Regex("\\s+"))
+                .filter { it.isNotBlank() }
+
+        for (client in streamClients) {
+            val response =
+                try {
+                    YouTube.player(videoId, null, client).getOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                } ?: continue
+
+            if (response.playabilityStatus.status != "OK") continue
+            val details = response.videoDetails ?: continue
+
+            val title = details.title.orEmpty()
+            val author = details.author.orEmpty()
+            if (details.musicVideoType == MUSIC_VIDEO_TYPE_ATV || author.endsWith("Topic", ignoreCase = true)) return null
+
+            // The id belongs to the song being resolved only when its own
+            // title says so — a stale or foreign id must not paint a
+            // different song's video under this title.
+            if (songTokens.isNotEmpty() && !songTokens.all { title.contains(it, true) }) return null
+
+            val videoUrl = bestVideoUrl(response) ?: continue
+            return CanvasArtwork(
+                name = title,
+                artist = author.takeIf { it.isNotBlank() },
+                videoUrl = videoUrl,
+            )
+        }
         return null
     }
 
