@@ -86,6 +86,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -599,10 +600,63 @@ fun VinylNowPlaying(
 }
 
 /**
+ * The record's geometry, in fractions of the disc's own diameter. Kept in one
+ * place because the artwork, the label and the tonearm's resting position all
+ * describe the same object from different call sites.
+ */
+private object VinylDisc {
+    /**
+     * Radius of the disc box, as a fraction of the square that holds it.
+     *
+     * Slightly under the disc's old size on purpose: the corner the tonearm
+     * lives in is the only space it has, and an arm has to be long enough to
+     * read as an arm rather than a stub. Every point taken off the record is
+     * given to the arm.
+     */
+    const val BoxFraction = 0.87f
+
+    /**
+     * Where the arm's bearing sits, in fractions of the square.
+     *
+     * As far into the corner as the counterweight behind it allows. The bearing
+     * is the far end of the arm, so each unit it moves outwards is a unit of
+     * arm: at 0.84/0.10 the arm was 22% of the square and read as a stub, and
+     * at 0.95/0.05 it is 30% and reads as an arm.
+     */
+    const val PivotX = 0.95f
+    const val PivotY = 0.05f
+
+    /** Draw-to-draw step of the groove band, as a fraction of the radius. */
+    const val GrooveStep = 0.009f
+
+    /** Innermost and outermost groove, as fractions of the radius. */
+    const val GrooveInner = 0.655f
+    const val GrooveOuter = 0.985f
+
+    /** The printed picture disc, and the paper label at its centre. */
+    const val Artwork = 0.615f
+    const val Label = 0.205f
+
+    /** Where the stylus sits on the grooves, as a fraction of the radius. */
+    const val StylusGroove = 0.78f
+}
+
+/**
  * The vinyl disc: the track's artwork pressed onto a grooved black record,
  * spinning while playing. It deliberately never draws an animated canvas — the
  * record shows plain artwork, and the canvas engines stay exclusive to the
  * other player designs.
+ *
+ * The disc is drawn the way a record is: a matte-black pressing with a dense,
+ * modulated groove band, brighter separators where a side is banded, a run-out
+ * of tight grooves around the label, and a machined edge catch-light. The
+ * artwork is pressed *into* that surface (a picture disc) rather than floating
+ * on top of it, and the label is a printed one with a ring and a hollow
+ * spindle.
+ *
+ * Two layers sit outside the rotation on purpose. Grooves, artwork and label
+ * turn with the record; the sheen and the rim highlight must not, because they
+ * describe a light source in the room rather than the thing that is spinning.
  */
 @Composable
 private fun SpinningVinyl(
@@ -622,94 +676,218 @@ private fun SpinningVinyl(
     val displayAngle = if (isPlaying) angle else 0f
 
     Box(
-        modifier = Modifier
-            // 0.90 keeps the disc radius at 0.45 × the parent square, which is
-            // the figure VinylTonearm derives its pivot geometry from.
-            .fillMaxSize(0.90f)
-            .rotate(displayAngle)
-            .clip(CircleShape)
-            .background(
-                Brush.radialGradient(
-                    colors = listOf(Color(0xFF1D1D1D), Color(0xFF090909)),
-                ),
-            ),
+        modifier =
+            Modifier
+                // 0.90 keeps the disc radius at 0.45 × the parent square, which is
+                // the figure VinylTonearm derives its pivot geometry from.
+                .fillMaxSize(VinylDisc.BoxFraction),
         contentAlignment = Alignment.Center,
     ) {
-        // Grooves across the playable surface.
+        // Warm halo behind the pressing, so the black disc sits in the room's
+        // light instead of being pasted onto it.
         Canvas(modifier = Modifier.fillMaxSize()) {
             val outerRadius = size.minDimension / 2f
-            val grooveStroke = 1.dp.toPx()
-            var position = 0.70f
-            while (position <= 0.98f) {
-                drawCircle(
-                    color = Color.White.copy(alpha = 0.07f),
-                    radius = outerRadius * position,
-                    style = Stroke(width = grooveStroke),
-                )
-                position += 0.03f
-            }
-            // Edge catch-light so the disc separates from the dark backdrop.
             drawCircle(
-                color = Color.White.copy(alpha = 0.10f),
-                radius = outerRadius - grooveStroke,
-                style = Stroke(width = grooveStroke * 1.5f),
+                brush = Brush.radialGradient(
+                    colorStops = arrayOf(
+                        0.62f to Color.Transparent,
+                        0.90f to VinylAccent.copy(alpha = 0.05f),
+                        1f to Color.Transparent,
+                    ),
+                    center = center,
+                    radius = outerRadius,
+                ),
+                radius = outerRadius,
             )
         }
 
-        if (!thumbnailUrl.isNullOrBlank()) {
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(thumbnailUrl)
-                    .crossfade(400)
-                    .build(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxSize(0.68f)
-                    .clip(CircleShape),
-            )
-        }
-
-        // Centre label with a spindle hole, sized like a real record's.
         Box(
-            modifier = Modifier
-                .fillMaxSize(0.22f)
-                .clip(CircleShape)
-                .background(Color(0xFF140F09))
-                .border(1.dp, VinylAccent.copy(alpha = 0.45f), CircleShape),
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .rotate(displayAngle)
+                    .clip(CircleShape),
             contentAlignment = Alignment.Center,
         ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val outerRadius = size.minDimension / 2f
+                val grooveStroke = 1.dp.toPx()
+
+                // The pressing itself: near-black with a warm centre, so the
+                // middle reads as the lit part of the disc and the edges fall
+                // away.
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colorStops = arrayOf(
+                            0f to Color(0xFF201D1A),
+                            0.55f to Color(0xFF141312),
+                            1f to Color(0xFF070707),
+                        ),
+                        center = center,
+                        radius = outerRadius,
+                    ),
+                    radius = outerRadius,
+                )
+
+                // Groove band. Two alternating alphas rather than one flat
+                // stroke: a single alpha reads as printed rings, an alternating
+                // one reads as a cut surface catching light.
+                var position = VinylDisc.GrooveInner
+                var ring = 0
+                while (position <= VinylDisc.GrooveOuter) {
+                    val alpha = if (ring % 2 == 0) 0.045f else 0.085f
+                    drawCircle(
+                        color = Color.White.copy(alpha = alpha),
+                        radius = outerRadius * position,
+                        style = Stroke(width = grooveStroke),
+                    )
+                    position += VinylDisc.GrooveStep
+                    ring++
+                }
+
+                // Banded separators: a real side carries three or four wider
+                // gaps between its tracks.
+                listOf(0.735f, 0.845f, 0.945f).forEach { band ->
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.13f),
+                        radius = outerRadius * band,
+                        style = Stroke(width = grooveStroke * 2f),
+                    )
+                }
+
+                // Run-out: the tight grooves the arm rides into at the end of a
+                // side, hard against the label.
+                listOf(0.645f, 0.656f).forEach { runOut ->
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.11f),
+                        radius = outerRadius * runOut,
+                        style = Stroke(width = grooveStroke * 1.4f),
+                    )
+                }
+
+                // A shadowed step at the artwork's edge, so the picture sits in
+                // the surface rather than on it.
+                drawCircle(
+                    color = Color.Black.copy(alpha = 0.55f),
+                    radius = outerRadius * (VinylDisc.Artwork + 0.012f),
+                    style = Stroke(width = 3.dp.toPx()),
+                )
+
+                // Machined edge: a dark outer band with a bright catch-light
+                // just inside it.
+                drawCircle(
+                    color = Color.Black.copy(alpha = 0.45f),
+                    radius = outerRadius - grooveStroke / 2f,
+                    style = Stroke(width = grooveStroke * 2f),
+                )
+                drawCircle(
+                    color = Color.White.copy(alpha = 0.16f),
+                    radius = outerRadius - grooveStroke * 3f,
+                    style = Stroke(width = grooveStroke * 1.2f),
+                )
+            }
+
+            if (!thumbnailUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model =
+                        ImageRequest.Builder(LocalContext.current)
+                            .data(thumbnailUrl)
+                            .crossfade(400)
+                            .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier =
+                        Modifier
+                            .fillMaxSize(VinylDisc.Artwork)
+                            .clip(CircleShape),
+                )
+            }
+
+            // Centre label: printed paper, a ring of the design's accent, and a
+            // hollow spindle the arm's own pivot echoes.
             Box(
-                modifier = Modifier
-                    .size(7.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFFE9E4D8)),
-            )
+                modifier =
+                    Modifier
+                        .fillMaxSize(VinylDisc.Label)
+                        .clip(CircleShape)
+                        .background(Color(0xFF14100B))
+                        .border(1.5.dp, VinylAccent.copy(alpha = 0.55f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val labelRadius = size.minDimension / 2f
+                    // A warm bloom over the paper, so the label is not a flat
+                    // hole punched in the middle of the record.
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colorStops = arrayOf(
+                                0f to VinylAccent.copy(alpha = 0.16f),
+                                0.7f to VinylAccent.copy(alpha = 0.05f),
+                                1f to Color.Transparent,
+                            ),
+                            center = center,
+                            radius = labelRadius,
+                        ),
+                        radius = labelRadius,
+                    )
+                    // A single fine ring, the way a pressed label carries one.
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.10f),
+                        radius = labelRadius * 0.80f,
+                        style = Stroke(width = 1.dp.toPx()),
+                    )
+                }
+
+                // Spindle: a hole with a lit rim, not a painted dot.
+                Box(
+                    modifier =
+                        Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF07060A))
+                            .border(1.dp, Color.White.copy(alpha = 0.22f), CircleShape),
+                )
+            }
         }
 
-        // Faint sheen for depth.
+        // Sheen: fixed to the screen, not to the record. Two bands crossing at
+        // an angle is the reflection a glossy disc shows under a ceiling light.
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.linearGradient(
-                        colors = listOf(
-                            Color.White.copy(alpha = 0.10f),
-                            Color.Transparent,
-                            Color.Transparent,
-                            Color.White.copy(alpha = 0.05f),
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape)
+                    .background(
+                        Brush.linearGradient(
+                            colorStops = arrayOf(
+                                0f to Color.White.copy(alpha = 0.085f),
+                                0.22f to Color.White.copy(alpha = 0.015f),
+                                0.45f to Color.Transparent,
+                                0.72f to Color.White.copy(alpha = 0.045f),
+                                1f to Color.Transparent,
+                            ),
                         ),
                     ),
-                ),
         )
     }
 }
 
 /**
- * The tonearm, drawn rather than assembled from rectangles so the pivot, tube
- * and headshell always line up with the disc: the stylus rests over the outer
- * grooves while playing and swings clear when paused. The canvas spans the
- * whole square, so the geometry follows the disc's radius at any screen size.
+ * The tonearm, drawn the way a tonearm is made: one straight axis from the
+ * machined bearing to the stylus, carrying a knurled counterweight on its tail
+ * and a headshell with a cartridge, a finger lift and a needle on its nose.
+ *
+ * The whole assembly rotates about the bearing, resting on the outer groove
+ * band while playing and swinging clear when paused, and because the canvas
+ * spans the whole square the geometry follows the disc's radius at any screen
+ * size.
+ *
+ * The look is deliberately quiet. Premium arms are gunmetal and black, and the
+ * finish carries them: a fine tapered tube instead of a fat bar, a highlight
+ * down one edge and a shadow down the other so it reads as a cylinder, a
+ * counterweight with real knurling and a set screw, an anti-skate weight on its
+ * wire, and exactly one note of the design's accent — the tip of the needle.
+ * A coloured block for a headshell is what a toy turntable has.
  */
 @Composable
 private fun VinylTonearm(
@@ -724,45 +902,235 @@ private fun VinylTonearm(
     )
     Canvas(modifier = modifier) {
         val discCentre = Offset(size.width / 2f, size.height / 2f)
-        val discRadius = size.width * 0.45f
-        val pivot = Offset(size.width * 0.90f, size.height * 0.07f)
+        val discRadius = size.width * VinylDisc.BoxFraction / 2f
+        val pivot = Offset(size.width * VinylDisc.PivotX, size.height * VinylDisc.PivotY)
 
         val towardsPivot = pivot - discCentre
-        val stylusRest = discCentre + towardsPivot / towardsPivot.getDistance() * (discRadius * 0.78f)
+        val stylusRest = discCentre + towardsPivot / towardsPivot.getDistance() * (discRadius * VinylDisc.StylusGroove)
         val arm = stylusRest - pivot
         val armLength = arm.getDistance()
         val armAngle = atan2(arm.y, arm.x) * 180f / PI.toFloat()
 
+        // Gunmetal and black; the accent appears once, at the needle.
+        val gunmetal = Color(0xFF4B463E)
+        val gunmetalDark = Color(0xFF2A2723)
+        val gunmetalLight = Color(0xFF8F8878)
+        val headshellBody = Color(0xFF302D28)
+        val cartridgeBody = Color(0xFF161412)
+        val needleBody = Color(0xFFB9B2A2)
+
         rotate(degrees = armAngle + lift, pivot = pivot) {
-            val tube = 5.dp.toPx()
+            val px = pivot.x
+            val py = pivot.y
 
-            // Counterweight behind the pivot.
+            // ---- tail ------------------------------------------------------
+            // Stub the counterweight turns on, then the weight itself: a dark
+            // sleeve of knurled metal with a set screw on top.
             drawRoundRect(
-                color = Color(0xFF8E8779),
-                topLeft = Offset(pivot.x - 24.dp.toPx(), pivot.y - tube * 1.6f),
-                size = Size(24.dp.toPx(), tube * 3.2f),
-                cornerRadius = CornerRadius(tube * 1.6f),
+                color = gunmetalDark,
+                topLeft = Offset(px - 5.dp.toPx(), py - 2.6.dp.toPx()),
+                size = Size(7.dp.toPx(), 5.2.dp.toPx()),
+                cornerRadius = CornerRadius(1.3.dp.toPx()),
+            )
+            // Kept short enough that the weight stays inside the square: the
+            // bearing is nearly in the corner now, and a long tail would be
+            // drawn off the edge of it.
+            val weightStart = px - 17.dp.toPx()
+            val weightSize = Size(15.dp.toPx(), 13.dp.toPx())
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.35f),
+                topLeft = Offset(weightStart + 0.6.dp.toPx(), py - weightSize.height / 2f + 1.2.dp.toPx()),
+                size = weightSize,
+                cornerRadius = CornerRadius(2.5.dp.toPx()),
+            )
+            drawRoundRect(
+                color = gunmetalDark,
+                topLeft = Offset(weightStart, py - weightSize.height / 2f),
+                size = weightSize,
+                cornerRadius = CornerRadius(2.5.dp.toPx()),
+            )
+            // Knurling: fine ridges, which is what makes the weight read as
+            // metal instead of as a hole in the arm.
+            var ridge = weightStart + 1.6.dp.toPx()
+            val ridgeEnd = weightStart + weightSize.width - 1.6.dp.toPx()
+            while (ridge <= ridgeEnd) {
+                drawLine(
+                    color = Color.White.copy(alpha = 0.075f),
+                    start = Offset(ridge, py - weightSize.height / 2f + 1.dp.toPx()),
+                    end = Offset(ridge, py + weightSize.height / 2f - 1.dp.toPx()),
+                    strokeWidth = 0.7.dp.toPx(),
+                )
+                ridge += 2.1.dp.toPx()
+            }
+            // Lit top edge, shaded bottom edge.
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.14f),
+                topLeft = Offset(weightStart + 1.dp.toPx(), py - weightSize.height / 2f + 0.8.dp.toPx()),
+                size = Size(weightSize.width - 2.dp.toPx(), 1.dp.toPx()),
+                cornerRadius = CornerRadius(0.5.dp.toPx()),
+            )
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.28f),
+                topLeft = Offset(weightStart + 1.dp.toPx(), py + weightSize.height / 2f - 1.8.dp.toPx()),
+                size = Size(weightSize.width - 2.dp.toPx(), 1.dp.toPx()),
+                cornerRadius = CornerRadius(0.5.dp.toPx()),
+            )
+            // Set screw.
+            drawCircle(
+                color = gunmetalLight.copy(alpha = 0.8f),
+                radius = 1.2.dp.toPx(),
+                center = Offset(weightStart + weightSize.width / 2f, py - weightSize.height / 2f - 0.6.dp.toPx()),
             )
 
-            // Tube from the pivot out to the record.
-            drawRoundRect(
-                color = Color(0xFFDDD7C7),
-                topLeft = Offset(pivot.x, pivot.y - tube / 2f),
-                size = Size(armLength, tube),
-                cornerRadius = CornerRadius(tube / 2f),
+            // Anti-skate: a wire off the bearing housing with a small weight on
+            // the end, the detail that says "set up by someone who cares".
+            drawLine(
+                color = gunmetalLight.copy(alpha = 0.4f),
+                start = Offset(px - 3.dp.toPx(), py + 4.5.dp.toPx()),
+                end = Offset(px + 0.5.dp.toPx(), py + 12.dp.toPx()),
+                strokeWidth = 0.7.dp.toPx(),
+            )
+            drawCircle(
+                color = gunmetal,
+                radius = 2.dp.toPx(),
+                center = Offset(px + 0.5.dp.toPx(), py + 13.dp.toPx()),
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = 0.18f),
+                radius = 2.dp.toPx(),
+                center = Offset(px + 0.5.dp.toPx(), py + 13.dp.toPx()),
+                style = Stroke(0.7.dp.toPx()),
             )
 
-            // Headshell over the grooves.
-            drawRoundRect(
-                color = VinylAccent,
-                topLeft = Offset(pivot.x + armLength - 20.dp.toPx(), pivot.y - 7.dp.toPx()),
-                size = Size(20.dp.toPx(), 14.dp.toPx()),
-                cornerRadius = CornerRadius(4.dp.toPx()),
+            // ---- tube ------------------------------------------------------
+            // Tapered, drawn as a closed path rather than a bar: it is narrow
+            // at the headshell and slightly wider at the bearing, which is how
+            // a real arm is machined. A dark copy behind it lifts the arm off
+            // the artwork.
+            val headshellLength = 21.dp.toPx()
+            val tubeStart = 2.dp.toPx()
+            val tubeEnd = armLength - headshellLength + 2.dp.toPx()
+            val halfAtBearing = 1.95.dp.toPx()
+            val halfAtHeadshell = 1.25.dp.toPx()
+            val shadowPath =
+                Path().apply {
+                    moveTo(px + tubeStart, py - halfAtBearing + 1.4.dp.toPx())
+                    lineTo(px + tubeEnd, py - halfAtHeadshell + 1.4.dp.toPx())
+                    lineTo(px + tubeEnd, py + halfAtHeadshell + 1.4.dp.toPx())
+                    lineTo(px + tubeStart, py + halfAtBearing + 1.4.dp.toPx())
+                    close()
+                }
+            drawPath(path = shadowPath, color = Color.Black.copy(alpha = 0.3f))
+            val tubePath =
+                Path().apply {
+                    moveTo(px + tubeStart, py - halfAtBearing)
+                    lineTo(px + tubeEnd, py - halfAtHeadshell)
+                    lineTo(px + tubeEnd, py + halfAtHeadshell)
+                    lineTo(px + tubeStart, py + halfAtBearing)
+                    close()
+                }
+            drawPath(path = tubePath, color = gunmetal)
+            // Cylinder shading: bright along the top, dark along the bottom.
+            drawLine(
+                color = Color.White.copy(alpha = 0.22f),
+                start = Offset(px + tubeStart, py - halfAtBearing + 0.9.dp.toPx()),
+                end = Offset(px + tubeEnd, py - halfAtHeadshell + 0.7.dp.toPx()),
+                strokeWidth = 0.9.dp.toPx(),
+                cap = StrokeCap.Round,
+            )
+            drawLine(
+                color = Color.Black.copy(alpha = 0.35f),
+                start = Offset(px + tubeStart, py + halfAtBearing - 0.4.dp.toPx()),
+                end = Offset(px + tubeEnd, py + halfAtHeadshell - 0.3.dp.toPx()),
+                strokeWidth = 0.9.dp.toPx(),
+                cap = StrokeCap.Round,
             )
 
-            // Pivot housing.
-            drawCircle(color = Color(0xFF6F6858), radius = 12.dp.toPx(), center = pivot)
-            drawCircle(color = VinylAccent.copy(alpha = 0.85f), radius = 5.dp.toPx(), center = pivot)
+            // ---- head ---------------------------------------------
+            // Cueing lever beside the bearing, where a hand finds it.
+            drawRoundRect(
+                color = gunmetal,
+                topLeft = Offset(px + 6.dp.toPx(), py + 3.5.dp.toPx()),
+                size = Size(2.2.dp.toPx(), 13.dp.toPx()),
+                cornerRadius = CornerRadius(1.1.dp.toPx()),
+            )
+            drawCircle(
+                color = gunmetalLight,
+                radius = 1.9.dp.toPx(),
+                center = Offset(px + 7.1.dp.toPx(), py + 16.5.dp.toPx()),
+            )
+
+            // Headshell: a slim plate, angled down onto the record, carrying the
+            // cartridge.
+            val headStart = px + armLength - headshellLength
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.3f),
+                topLeft = Offset(headStart + 0.8.dp.toPx(), py - 6.dp.toPx() + 1.2.dp.toPx()),
+                size = Size(headshellLength, 12.dp.toPx()),
+                cornerRadius = CornerRadius(2.dp.toPx()),
+            )
+            drawRoundRect(
+                color = headshellBody,
+                topLeft = Offset(headStart, py - 6.dp.toPx()),
+                size = Size(headshellLength, 12.dp.toPx()),
+                cornerRadius = CornerRadius(2.dp.toPx()),
+            )
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.12f),
+                topLeft = Offset(headStart + 1.5.dp.toPx(), py - 5.4.dp.toPx()),
+                size = Size(headshellLength - 3.dp.toPx(), 1.dp.toPx()),
+                cornerRadius = CornerRadius(0.5.dp.toPx()),
+            )
+            // Cartridge under the plate, with the two mounting screws.
+            drawRoundRect(
+                color = cartridgeBody,
+                topLeft = Offset(headStart + 1.5.dp.toPx(), py - 2.4.dp.toPx()),
+                size = Size(headshellLength - 3.dp.toPx(), 8.dp.toPx()),
+                cornerRadius = CornerRadius(1.5.dp.toPx()),
+            )
+            listOf(4.dp, 14.dp).forEach { offset ->
+                drawCircle(
+                    color = gunmetalLight.copy(alpha = 0.55f),
+                    radius = 0.8.dp.toPx(),
+                    center = Offset(headStart + offset.toPx(), py + 3.4.dp.toPx()),
+                )
+            }
+            // Finger lift: the small tab that makes the head liftable.
+            drawRoundRect(
+                color = gunmetalLight.copy(alpha = 0.9f),
+                topLeft = Offset(px + armLength - 3.4.dp.toPx(), py - 11.5.dp.toPx()),
+                size = Size(2.2.dp.toPx(), 6.dp.toPx()),
+                cornerRadius = CornerRadius(1.1.dp.toPx()),
+            )
+            // Stylus: the one accent on the arm, at the point the geometry put
+            // on the grooves.
+            drawLine(
+                color = needleBody,
+                start = Offset(px + armLength - 1.6.dp.toPx(), py + 5.dp.toPx()),
+                end = Offset(px + armLength - 0.6.dp.toPx(), py + 8.4.dp.toPx()),
+                strokeWidth = 1.1.dp.toPx(),
+                cap = StrokeCap.Round,
+            )
+            drawCircle(
+                color = VinylAccent.copy(alpha = 0.95f),
+                radius = 0.85.dp.toPx(),
+                center = Offset(px + armLength - 0.6.dp.toPx(), py + 8.4.dp.toPx()),
+            )
+
+            // ---- bearing ---------------------------------------------------
+            // Drawn last so the tube passes under it: a machined housing with a
+            // shadowed rim, a lit face and a dark centre.
+            drawCircle(color = Color.Black.copy(alpha = 0.35f), radius = 11.6.dp.toPx(), center = pivot)
+            drawCircle(color = Color(0xFF17150F), radius = 10.4.dp.toPx(), center = pivot)
+            drawCircle(color = gunmetal, radius = 8.2.dp.toPx(), center = pivot)
+            drawCircle(
+                color = Color.White.copy(alpha = 0.22f),
+                radius = 7.7.dp.toPx(),
+                center = pivot,
+                style = Stroke(0.9.dp.toPx()),
+            )
+            drawCircle(color = Color(0xFF26231E), radius = 4.dp.toPx(), center = pivot)
+            drawCircle(color = VinylAccent.copy(alpha = 0.75f), radius = 1.5.dp.toPx(), center = pivot)
         }
     }
 }
