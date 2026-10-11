@@ -15,6 +15,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
@@ -37,8 +38,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -600,14 +606,24 @@ private fun AppleMusicMainTitleRow(
     val navController = LocalNavController.current
 
     // The artist line is the only way into an artist page from this design, so
-    // it is a link. A track can credit several artists and the metadata can
-    // carry a credit with no id at all, so the target is the first credit that
-    // actually resolves to a page rather than blindly the first one.
-    val artistTargetId =
-        mediaMetadata?.artists
-            ?.firstOrNull { !it.id.isNullOrBlank() }
-            ?.id
-    
+    // every name in it is its own link. A track can credit several artists and
+    // the metadata can carry a credit with no id at all, so each name is
+    // annotated with the id of the credit it belongs to, and a credit without
+    // one simply is not a link. The row used to carry a single click target
+    // pointing at the first credit, so tapping any name opened the same
+    // artist's page regardless of which name was pressed.
+    val artists = mediaMetadata?.artists.orEmpty()
+    val artistsLine =
+        buildAnnotatedString {
+            artists.forEachIndexed { index, artist ->
+                pushStringAnnotation(tag = "artist", annotation = artist.id.orEmpty())
+                withStyle(SpanStyle()) { append(artist.name) }
+                pop()
+                if (index != artists.lastIndex) append(", ")
+            }
+        }
+    var artistLayoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+
     Row(
         // AppleMusicGutter, not a literal: the canvas-glow mini lyrics above this
         // row are drawn over full-bleed artwork and pad themselves by the same
@@ -629,15 +645,7 @@ private fun AppleMusicMainTitleRow(
             Spacer(modifier = Modifier.height(4.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier =
-                    Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .clickable(enabled = artistTargetId != null) {
-                            artistTargetId?.let { artistId ->
-                                navController.navigate("artist/$artistId")
-                                bottomSheetState.collapseSoft()
-                            }
-                        },
+                modifier = Modifier.clip(RoundedCornerShape(6.dp)),
             ) {
                 if (mediaMetadata?.explicit == true) {
                     Icon(
@@ -648,11 +656,28 @@ private fun AppleMusicMainTitleRow(
                     )
                 }
                 Text(
-                    text = mediaMetadata?.artists?.joinToString { it.name } ?: "",
+                    text = artistsLine,
                     style = typography.mainArtist,
                     maxLines = 1,
                     color = AppleMusicTextSecondary,
-                    modifier = Modifier.basicMarquee()
+                    onTextLayout = { artistLayoutResult = it },
+                    modifier = Modifier
+                        .basicMarquee()
+                        .pointerInput(artistsLine) {
+                            detectTapGestures { position ->
+                                val layout = artistLayoutResult ?: return@detectTapGestures
+                                val offset = layout.getOffsetForPosition(position)
+                                artistsLine
+                                    .getStringAnnotations("artist", offset, offset)
+                                    .firstOrNull()
+                                    ?.let { annotation ->
+                                        if (annotation.item.isNotBlank()) {
+                                            navController.navigate("artist/${annotation.item}")
+                                            bottomSheetState.collapseSoft()
+                                        }
+                                    }
+                            }
+                        },
                 )
             }
         }
